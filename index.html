@@ -12,7 +12,6 @@
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Configuration Firebase
         const firebaseConfig = {
             apiKey: "AIzaSyCaLj-265kyKSuMSzm34RpKqPw7NX8tuVw",
             authDomain: "vocal-ping-pong.firebaseapp.com",
@@ -34,29 +33,25 @@
         let controlMode = 'remote'; 
         let unsubscribeListeners = [];
 
-        // --- AUTHENTIFICATION ---
         const initAuth = async () => {
-            try {
-                await signInAnonymously(auth);
-            } catch (error) {
-                console.error("Auth error:", error);
-            }
             onAuthStateChanged(auth, (user) => {
                 if (user) startApp();
+                else signInAnonymously(auth);
             });
         };
 
-        // --- LOGIQUE MANETTE (OPTIMISÉE IPHONE) ---
+        // --- LOGIQUE MANETTE (ULTRA-RÉACTIVE) ---
         const initController = async (team) => {
             const statusText = document.getElementById('controller-status');
             const volumeBar = document.getElementById('volume-bar');
             const localSensRange = document.getElementById('local-sens-range');
             const localSensValue = document.getElementById('local-sens-value');
             const startBtn = document.getElementById('start-mic-btn');
+            const networkDot = document.getElementById('network-dot');
             
-            let localSensMultiplier = 1.0;
+            let localSensMultiplier = 1.5;
             let smoothedVolume = 0;
-            let audioContext;
+            let lastSentValue = -1;
 
             localSensRange.addEventListener('input', (e) => {
                 localSensMultiplier = parseFloat(e.target.value);
@@ -65,34 +60,25 @@
 
             startBtn.addEventListener('click', async () => {
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ 
-                        audio: {
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: false
-                        } 
-                    });
-                    
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
                     if (audioContext.state === 'suspended') await audioContext.resume();
 
                     const source = audioContext.createMediaStreamSource(stream);
                     const analyser = audioContext.createAnalyser();
-                    
-                    // Réduction du buffer pour gagner en réactivité (latence minimale)
                     analyser.fftSize = 256; 
-                    analyser.smoothingTimeConstant = 0.2; // Très bas pour coller à la voix
-                    
                     source.connect(analyser);
                     const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
                     startBtn.classList.add('hidden');
-                    statusText.innerText = `Connecté : ${team === 'blue' ? 'Bleue' : 'Rouge'}`;
-                    statusText.className = "text-green-400 font-black bg-slate-900 px-6 py-2 rounded-full border border-green-500/30";
+                    statusText.innerText = `Équipe ${team === 'blue' ? 'Bleue' : 'Rouge'} ACTIVE`;
+                    statusText.className = "text-green-400 font-bold text-sm bg-slate-900 px-6 py-2 rounded-full border border-green-500/20";
+                    networkDot.classList.remove('bg-red-500');
+                    networkDot.classList.add('bg-green-500', 'animate-pulse');
 
-                    // Boucle de détection ultra-rapide (30ms)
+                    // Boucle 60ms : Idéal pour Firestore sans saturation
                     setInterval(async () => {
-                        if (!auth.currentUser || audioContext.state !== 'running') return;
+                        if (!auth.currentUser) return;
                         
                         analyser.getByteTimeDomainData(dataArray);
                         let sumSquares = 0;
@@ -100,38 +86,30 @@
                             let normalized = (dataArray[i] - 128) / 128;
                             sumSquares += normalized * normalized;
                         }
-                        
                         let currentRMS = Math.sqrt(sumSquares / dataArray.length);
                         
-                        // Boost logiciel accru pour iPhone (x20 au lieu de x15)
-                        let rawVolume = currentRMS * localSensMultiplier * 20; 
-
-                        // Seuil de coupure net
-                        if (rawVolume < 0.03) rawVolume = 0;
-
-                        // Lissage réduit (0.7 / 0.3) pour plus de réactivité sur iOS
-                        smoothedVolume = (smoothedVolume * 0.3) + (rawVolume * 0.7);
+                        // Calcul réactif
+                        let rawVolume = currentRMS * localSensMultiplier * 25; 
+                        if (rawVolume < 0.02) rawVolume = 0;
                         
-                        const finalVolume = Math.min(smoothedVolume, 2.5);
+                        // Lissage léger pour garder la réactivité
+                        smoothedVolume = (smoothedVolume * 0.2) + (rawVolume * 0.8);
+                        const finalVolume = Math.min(smoothedVolume, 3.0);
                         
-                        try {
-                            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'paddle_volumes', team);
-                            await setDoc(docRef, { volume: finalVolume, lastUpdate: Date.now() }, { merge: true });
-                        } catch (e) {}
-                        
-                        volumeBar.style.height = Math.min(finalVolume * 40, 100) + '%';
-                    }, 30);
-
-                    // Garde-fou pour iPhone : empêcher la mise en veille de l'audio
-                    document.addEventListener('visibilitychange', () => {
-                        if (document.visibilityState === 'visible' && audioContext) {
-                            audioContext.resume();
+                        // Optimisation : On n'envoie que si le volume change significativement
+                        if (Math.abs(finalVolume - lastSentValue) > 0.01 || finalVolume === 0) {
+                            try {
+                                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'paddle_volumes', team);
+                                await setDoc(docRef, { volume: finalVolume, t: Date.now() }, { merge: true });
+                                lastSentValue = finalVolume;
+                            } catch (e) {}
                         }
-                    });
+                        
+                        volumeBar.style.height = Math.min(finalVolume * 33, 100) + '%';
+                    }, 60);
 
                 } catch (err) {
-                    statusText.innerText = "Erreur : " + err.message;
-                    console.error(err);
+                    statusText.innerText = "Autorisez le micro !";
                 }
             });
         };
@@ -168,18 +146,15 @@
             let hostDataArray = null;
 
             const resize = () => {
-                const containerWidth = Math.min(window.innerWidth * 0.9, 800);
-                canvas.width = containerWidth;
+                canvas.width = Math.min(window.innerWidth * 0.9, 800);
                 canvas.height = Math.max(380, Math.min(window.innerHeight * 0.45, 450));
                 resetPositions();
             };
 
             const resetPositions = () => {
-                ball.x = canvas.width / 2; 
-                ball.y = canvas.height / 2;
-                ball.vx = 0; ball.vy = 0;
-                paddleL.y = canvas.height / 2 - config.paddleHeight / 2;
-                paddleR.y = canvas.height / 2 - config.paddleHeight / 2;
+                ball.x = canvas.width / 2; ball.y = canvas.height / 2;
+                ball.vx = ball.vy = 0;
+                paddleL.y = paddleR.y = canvas.height / 2 - config.paddleHeight / 2;
                 paddleL.vy = paddleR.vy = 0;
             };
 
@@ -188,15 +163,9 @@
                 unsubscribeListeners.forEach(unsub => unsub());
                 unsubscribeListeners = [];
                 ['blue', 'red'].forEach(team => {
-                    const unsub = onSnapshot(
-                        doc(db, 'artifacts', appId, 'public', 'data', 'paddle_volumes', team),
-                        (d) => { 
-                            if(d.exists()) {
-                                remoteVolumes[team] = d.data().volume; 
-                            }
-                        },
-                        (err) => console.warn("Firestore error", err)
-                    );
+                    const unsub = onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'paddle_volumes', team), (d) => { 
+                        if(d.exists()) remoteVolumes[team] = d.data().volume; 
+                    }, (err) => console.warn(err));
                     unsubscribeListeners.push(unsub);
                 });
             };
@@ -204,12 +173,8 @@
             function update() {
                 if (controlMode === 'local' && hostAnalyser) {
                     hostAnalyser.getByteTimeDomainData(hostDataArray);
-                    let sum = 0;
-                    for (let i = 0; i < hostDataArray.length; i++) {
-                        let val = (hostDataArray[i] - 128) / 128;
-                        sum += val * val;
-                    }
-                    localVolume = Math.sqrt(sum / hostDataArray.length) * 15;
+                    let s = 0; for(let i=0; i<hostDataArray.length; i++) { let v=(hostDataArray[i]-128)/128; s+=v*v; }
+                    localVolume = Math.sqrt(s/hostDataArray.length)*15;
                     localVolBar.style.width = Math.min(localVolume * 50, 100) + '%';
                 }
 
@@ -219,20 +184,14 @@
                     if (!isRunning) { liftL = remoteVolumes.blue; liftR = remoteVolumes.red; }
                     else { if (isBallLeft) liftL = remoteVolumes.blue; else liftR = remoteVolumes.red; }
                 } else {
-                    if (!isRunning) { liftL = liftR = localVolume; }
-                    else { if (isBallLeft) liftL = localVolume; else liftR = localVolume; }
+                    liftL = liftR = (isRunning ? (isBallLeft ? localVolume : localVolume) : localVolume);
                 }
 
                 paddleL.vy -= liftL * config.liftPower;
                 paddleR.vy -= liftR * config.liftPower;
 
-                if (keys['KeyW']) paddleL.vy -= 1.2;
-                if (keys['KeyS']) paddleL.vy += 1.2;
-                if (keys['ArrowUp']) paddleR.vy -= 1.2;
-                if (keys['ArrowDown']) paddleR.vy += 1.2;
-
                 [paddleL, paddleR].forEach(p => {
-                    p.vy += config.gravity; p.vy *= 0.92; p.y += p.vy;
+                    p.vy += config.gravity; p.vy *= 0.9; p.y += p.vy;
                     if (p.y < 0) { p.y = 0; p.vy = 0; }
                     if (p.y > canvas.height - config.paddleHeight) { p.y = canvas.height - config.paddleHeight; p.vy = 0; }
                 });
@@ -258,7 +217,7 @@
             function draw() {
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
                 ctx.setLineDash([10, 15]); ctx.strokeStyle = '#334155'; ctx.lineWidth = 2;
-                ctx.beginPath(); ctx.moveTo(canvas.width / 2, 0); ctx.lineTo(canvas.width / 2, canvas.height); ctx.stroke(); ctx.setLineDash([]);
+                ctx.beginPath(); ctx.moveTo(canvas.width / 2, 0); ctx.lineTo(canvas.width / 2, canvas.height); ctx.stroke();
                 const isBallLeft = ball.x < canvas.width / 2;
                 ctx.fillStyle = (!isRunning || isBallLeft) ? config.colorLeft : '#1e3a8a';
                 ctx.fillRect(10, paddleL.y, config.paddleWidth, config.paddleHeight);
@@ -275,7 +234,7 @@
                 let count = 3;
                 const ctn = document.getElementById('countdown-container');
                 const ctxText = document.getElementById('countdown-text');
-                ctn.classList.remove('hidden'); ctxText.style.opacity = 1;
+                ctn.classList.remove('hidden');
                 const timer = setInterval(() => {
                     if(count > 0) { ctxText.innerText = count; count--; }
                     else {
@@ -291,46 +250,24 @@
             modeToggle.addEventListener('click', () => {
                 controlMode = controlMode === 'remote' ? 'local' : 'remote';
                 modeToggle.innerText = controlMode === 'remote' ? 'MODE : TÉLÉPHONES' : 'MODE : PC LOCAL';
-                if (controlMode === 'local') {
-                    qrSection.classList.add('hidden');
-                    controlGrid.classList.remove('md:grid-cols-2');
-                    controlGrid.classList.add('flex', 'flex-col', 'items-center');
-                } else {
-                    qrSection.classList.remove('hidden');
-                    controlGrid.classList.remove('flex', 'flex-col', 'items-center');
-                    controlGrid.classList.add('md:grid-cols-2');
-                }
+                if (controlMode === 'local') { qrSection.classList.add('hidden'); controlGrid.classList.remove('md:grid-cols-2'); controlGrid.classList.add('flex', 'flex-col', 'items-center'); }
+                else { qrSection.classList.remove('hidden'); controlGrid.classList.remove('flex', 'flex-col', 'items-center'); controlGrid.classList.add('md:grid-cols-2'); }
             });
 
-            sensitivityRange.addEventListener('input', (e) => {
-                config.liftPower = parseFloat(e.target.value);
-                sensitivityValue.innerText = e.target.value;
-            });
-            
-            document.getElementById('reset-btn').addEventListener('click', () => { score.left = 0; score.right = 0; scoreLeftEl.innerText = 0; scoreRightEl.innerText = 0; showRoundStart(); });
+            sensitivityRange.addEventListener('input', (e) => { config.liftPower = parseFloat(e.target.value); sensitivityValue.innerText = e.target.value; });
+            document.getElementById('reset-btn').addEventListener('click', () => { score.left = score.right = 0; scoreLeftEl.innerText = scoreRightEl.innerText = 0; showRoundStart(); });
             document.getElementById('minus-left-btn').addEventListener('click', () => { if(score.left > 0) scoreLeftEl.innerText = --score.left; });
             document.getElementById('minus-right-btn').addEventListener('click', () => { if(score.right > 0) scoreRightEl.innerText = --score.right; });
-            window.addEventListener('keydown', e => keys[e.code] = true);
-            window.addEventListener('keyup', e => keys[e.code] = false);
             window.addEventListener('resize', resize);
-            
-            setupListeners();
-            resize(); 
-            draw();
-            
+            setupListeners(); resize(); draw();
             const baseUrl = window.location.href.split('?')[0];
             new window.QRCode(document.getElementById("qr-blue"), { width: 110, height: 110, text: baseUrl + "?role=blue" });
             new window.QRCode(document.getElementById("qr-red"), { width: 110, height: 110, text: baseUrl + "?role=red" });
         };
 
         const startApp = () => {
-            if (role === 'host') {
-                document.getElementById('host-view').classList.remove('hidden');
-                initHost();
-            } else {
-                document.getElementById('controller-view').classList.remove('hidden');
-                initController(role);
-            }
+            if (role === 'host') { document.getElementById('host-view').classList.remove('hidden'); initHost(); }
+            else { document.getElementById('controller-view').classList.remove('hidden'); initController(role); }
         };
 
         initAuth();
@@ -340,24 +277,15 @@
         canvas { background: #1e293b; border: 4px solid #334155; border-radius: 12px; display: block; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
         .hidden { display: none !important; }
         .qr-card { background: white; padding: 8px; border-radius: 8px; color: black; }
-        input[type=range] { accent-color: #3b82f6; cursor: pointer; }
-        #local-sens-range::-webkit-slider-thumb {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            background: #3b82f6;
-            cursor: pointer;
-            -webkit-appearance: none;
-            border: 4px solid white;
-            box-shadow: 0 0 15px rgba(0,0,0,0.5);
-        }
+        input[type=range] { accent-color: #3b82f6; cursor: pointer; height: 1.5rem; }
+        #local-sens-range::-webkit-slider-thumb { width: 32px; height: 32px; border-radius: 50%; background: #3b82f6; -webkit-appearance: none; border: 4px solid white; }
     </style>
 </head>
 <body>
 
 <div id="game-container" class="min-h-screen flex flex-col items-center justify-start p-4 pt-8">
     
-    <!-- VUE HÔTE (Ordinateur) -->
+    <!-- VUE HÔTE -->
     <div id="host-view" class="hidden flex flex-col items-center w-full max-w-5xl gap-4">
         <div class="w-full flex flex-col items-center gap-2">
             <h1 class="text-xl font-black text-slate-500 uppercase tracking-widest">Vocal Ping-Pong</h1>
@@ -366,90 +294,66 @@
                 <div class="text-slate-600 text-2xl font-bold">—</div>
                 <div id="score-right" class="text-4xl text-red-500 font-black">0</div>
             </div>
-            <button id="mode-toggle" class="mt-2 bg-blue-600 px-6 py-2 rounded-full font-bold text-[10px] tracking-widest transition-all hover:bg-blue-500">MODE : TÉLÉPHONES</button>
+            <button id="mode-toggle" class="mt-2 bg-blue-600 px-6 py-2 rounded-full font-bold text-[10px] tracking-widest transition-all">MODE : TÉLÉPHONES</button>
         </div>
 
         <div class="relative w-full max-w-[800px] flex justify-center mt-2">
             <canvas id="pongCanvas"></canvas>
             <div id="overlay" class="absolute inset-0 bg-black/70 flex items-center justify-center z-50 backdrop-blur-sm rounded-xl">
-                <div class="text-center p-6 flex flex-col items-center gap-4">
-                    <button id="next-round-btn" class="bg-blue-600 hover:bg-blue-500 px-12 py-4 rounded-full font-black text-xl shadow-2xl transition-all border-b-4 border-blue-800 active:border-b-0">LANCER LA BALLE</button>
-                    <div class="text-[10px] text-blue-400 font-bold uppercase tracking-widest opacity-80 text-center px-4">Utilisez vos téléphones pour piloter les raquettes</div>
-                </div>
+                <button id="next-round-btn" class="bg-blue-600 hover:bg-blue-500 px-12 py-4 rounded-full font-black text-xl shadow-2xl border-b-4 border-blue-800 active:border-b-0">LANCER LA BALLE</button>
             </div>
             <div id="countdown-container" class="hidden absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
                 <div id="countdown-text" class="text-8xl font-black text-white drop-shadow-2xl">3</div>
             </div>
         </div>
 
-        <div class="w-full max-w-[250px] h-1.5 bg-slate-800 rounded-full overflow-hidden mb-4">
-            <div id="local-vocal-bar" class="h-full bg-green-500 transition-all duration-75" style="width: 0%"></div>
-        </div>
+        <div class="w-full max-w-[250px] h-1.5 bg-slate-800 rounded-full overflow-hidden mb-4"><div id="local-vocal-bar" class="h-full bg-green-500 transition-all duration-75" style="width: 0%"></div></div>
 
         <div id="control-grid" class="w-full grid grid-cols-1 md:grid-cols-2 gap-6 max-w-[800px]">
             <div id="qr-section" class="bg-slate-800/30 p-5 rounded-3xl border border-slate-700/50 flex flex-col items-center gap-4">
                 <h2 class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Connecter manettes</h2>
                 <div class="flex gap-10">
-                    <div class="flex flex-col items-center gap-2">
-                        <div id="qr-blue" class="qr-card"></div>
-                        <span class="text-[9px] text-blue-500 font-black uppercase">Bleue</span>
-                    </div>
-                    <div class="flex flex-col items-center gap-2">
-                        <div id="qr-red" class="qr-card"></div>
-                        <span class="text-[9px] text-red-500 font-black uppercase">Rouge</span>
-                    </div>
+                    <div class="flex flex-col items-center gap-2"><div id="qr-blue" class="qr-card"></div><span class="text-[9px] text-blue-500 font-black uppercase">Bleue</span></div>
+                    <div class="flex flex-col items-center gap-2"><div id="qr-red" class="qr-card"></div><span class="text-[9px] text-red-500 font-black uppercase">Rouge</span></div>
                 </div>
             </div>
-
             <div class="flex flex-col gap-4">
-                <div id="sensitivity-module" class="bg-slate-800/80 p-6 rounded-3xl border border-slate-700 shadow-xl flex flex-col justify-center">
-                    <div class="flex justify-between items-center mb-4">
-                        <label class="text-[10px] uppercase font-black text-slate-400 tracking-widest">Sensibilité Hôte</label>
-                        <span id="sensitivity-value" class="text-blue-400 font-mono font-bold text-sm bg-blue-900/20 px-3 py-1 rounded-lg">1.2</span>
-                    </div>
-                    <input type="range" id="sensitivity-range" min="0.2" max="6.0" step="0.1" value="1.2" class="w-full h-2 bg-slate-700 rounded-lg appearance-none">
+                <div class="bg-slate-800/80 p-6 rounded-3xl border border-slate-700 shadow-xl flex flex-col justify-center">
+                    <div class="flex justify-between items-center mb-4"><label class="text-[10px] uppercase font-black text-slate-400 tracking-widest">Sensibilité Hôte</label><span id="sensitivity-value" class="text-blue-400 font-mono font-bold text-sm bg-blue-900/20 px-3 py-1 rounded-lg">1.2</span></div>
+                    <input type="range" id="sensitivity-range" min="0.2" max="6.0" step="0.1" value="1.2" class="w-full appearance-none bg-slate-700 rounded-lg">
                 </div>
                 <div class="bg-slate-800/80 p-5 rounded-3xl border border-slate-700 shadow-xl flex flex-wrap gap-3 justify-center">
-                    <button id="reset-btn" class="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-xl text-[9px] font-bold border border-slate-600 uppercase">Reset Match</button>
-                    <button id="minus-left-btn" class="bg-blue-900/40 hover:bg-blue-800/40 px-4 py-2 rounded-xl text-[9px] font-bold border border-blue-700 text-blue-300">-1 Bleu</button>
-                    <button id="minus-right-btn" class="bg-red-900/40 hover:bg-red-800/40 px-4 py-2 rounded-xl text-[9px] font-bold border border-red-700 text-red-300">-1 Rouge</button>
+                    <button id="reset-btn" class="bg-slate-700 px-4 py-2 rounded-xl text-[9px] font-bold border border-slate-600 uppercase">Reset Match</button>
+                    <button id="minus-left-btn" class="bg-blue-900/40 px-4 py-2 rounded-xl text-[9px] font-bold border border-blue-700 text-blue-300">-1 Bleu</button>
+                    <button id="minus-right-btn" class="bg-red-900/40 px-4 py-2 rounded-xl text-[9px] font-bold border border-red-700 text-red-300">-1 Rouge</button>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- VUE MANETTE (Téléphone) -->
+    <!-- VUE MANETTE -->
     <div id="controller-view" class="hidden flex flex-col items-center text-center p-8 gap-6 w-full max-w-sm pt-8">
-        <h1 class="text-4xl font-black italic text-white uppercase tracking-tighter">Manette</h1>
-        
-        <div id="controller-status" class="flex flex-col gap-4 items-center">
-            <p class="text-slate-400 text-sm">Action requise pour iPhone</p>
-            <button id="start-mic-btn" class="bg-green-600 hover:bg-green-500 text-white px-10 py-5 rounded-full font-black text-xl shadow-2xl border-b-4 border-green-800 active:border-b-0 animate-bounce">ACTIVER MANETTE</button>
+        <div class="flex justify-between w-full items-center">
+            <h1 class="text-2xl font-black italic text-white uppercase tracking-tighter">Manette</h1>
+            <div id="network-dot" class="w-3 h-3 rounded-full bg-red-500 shadow-lg"></div>
         </div>
         
-        <!-- Jauge de volume -->
+        <div id="controller-status" class="w-full">
+            <button id="start-mic-btn" class="w-full bg-blue-600 hover:bg-blue-500 text-white px-8 py-6 rounded-3xl font-black text-xl shadow-2xl border-b-4 border-blue-800 active:border-b-0">ACTIVER MANETTE</button>
+        </div>
+        
         <div class="w-full aspect-square bg-slate-800 rounded-[4rem] border-8 border-slate-700 flex items-end overflow-hidden p-6 shadow-2xl relative">
-            <div id="volume-bar" class="w-full bg-gradient-to-t from-green-600 to-green-400 rounded-[3rem] transition-all duration-75 shadow-[0_0_50px_rgba(34,197,94,0.3)]" style="height: 0%;"></div>
-            <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <span class="text-white/10 text-8xl font-black uppercase rotate-90">VOCAL</span>
-            </div>
+            <div id="volume-bar" class="w-full bg-gradient-to-t from-blue-600 to-cyan-400 rounded-[3rem] transition-all duration-75 shadow-[0_0_50px_rgba(59,130,246,0.3)]" style="height: 0%;"></div>
+            <div class="absolute inset-0 flex items-center justify-center pointer-events-none text-white/5 text-8xl font-black uppercase rotate-90">VOCAL</div>
         </div>
 
-        <!-- Réglage de sensibilité locale -->
         <div class="w-full bg-slate-800/80 p-8 rounded-[2.5rem] border border-slate-700 shadow-xl flex flex-col gap-6">
             <div class="flex justify-between items-center">
-                <div class="flex flex-col items-start text-left">
-                    <label class="text-[11px] uppercase font-black text-slate-400 tracking-widest">Ma Sensibilité</label>
-                    <span class="text-[9px] text-slate-500 font-bold">Plus haut = plus réactif</span>
-                </div>
-                <span id="local-sens-value" class="text-blue-400 font-mono font-bold text-2xl bg-blue-900/30 px-5 py-2 rounded-2xl border border-blue-500/30">1.0</span>
+                <div class="flex flex-col items-start text-left"><label class="text-[11px] uppercase font-black text-slate-400 tracking-widest">Sensibilité Micro</label><span class="text-[9px] text-slate-500 font-bold uppercase">Plus haut = plus sensible</span></div>
+                <span id="local-sens-value" class="text-blue-400 font-mono font-bold text-3xl">1.5</span>
             </div>
-            <input type="range" id="local-sens-range" min="0.5" max="15.0" step="0.2" value="1.0" class="w-full h-4 bg-slate-700 rounded-lg appearance-none">
+            <input type="range" id="local-sens-range" min="0.5" max="25.0" step="0.5" value="1.5" class="w-full appearance-none bg-slate-700 rounded-lg">
         </div>
-
-        <p class="text-slate-400 font-medium leading-tight text-sm px-4">
-            Criez ou émettez un son continu pour faire <span class="text-green-400 font-black">monter</span> votre raquette.
-        </p>
     </div>
 
 </div>
